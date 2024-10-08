@@ -55,10 +55,9 @@ void handle_request(int client_socket) {
 
     // Открытие файла и отправка содержимого клиенту
     if (file_path && *file_path) {
-        char full_path[MAX_REQUEST_SIZE];
-        snprintf(file_path, MAX_REQUEST_SIZE, "%s", file_path);
+        snprintf(file_path, MAX_REQUEST_SIZE, "resources%s", file_path);
 
-        file_fd = open(full_path, O_RDONLY);
+        file_fd = open(file_path, O_RDONLY);
         if (file_fd < 0) {
             snprintf(response, BUFFER_SIZE, "HTTP/1.1 404 Not Found\r\n\r\n");
             send(client_socket, response, strlen(response), 0);
