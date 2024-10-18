@@ -2,138 +2,126 @@
 // Created by ciuis on 08.10.2024.
 //
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#endif
-#include <sys/types.h>
-#include <fcntl.h>
-#include <errno.h>
+#include "server.h"
+#include "request.h"
+#include "response.h"
 
-#define PORT 8080
-#define BUFFER_SIZE 1024
-#define MAX_REQUEST_SIZE 4096
+#include <signal.h>
+#include <stdbool.h>
 
-void handle_request(int client_socket) {
-    char request[MAX_REQUEST_SIZE];
-    char response[BUFFER_SIZE];
-    char* file_path = NULL;
-    int file_fd;
-    ssize_t bytes_read;
+volatile sig_atomic_t stop = false;
 
-    // Читаем запрос от клиента
-    bytes_read = recv(client_socket, request, MAX_REQUEST_SIZE - 1, 0);
-    if (bytes_read < 0) {
-        int error = WSAGetLastError();
-        printf("Read error...: %d\n", error);
-        closesocket(client_socket);
-        return;
-    }
-    request[bytes_read] = '\0';
-
-    // Парсим запрос
-    if (strncmp(request, "GET ", 4) == 0) {
-        file_path = request + 4;
-        char* end_of_path = strchr(file_path, ' ');
-        if (end_of_path) *end_of_path = '\0';
-    }
-
-    // File path logging
-    if (file_path && *file_path) {
-        printf("Requested file: %s\n", file_path);
-    } else {
-        printf("Invalid request\n");
-    }
-
-    // Открытие файла и отправка содержимого клиенту
-    if (file_path && *file_path) {
-        snprintf(file_path, MAX_REQUEST_SIZE, "resources%s", file_path);
-
-        file_fd = open(file_path, O_RDONLY);
-        if (file_fd < 0) {
-            snprintf(response, BUFFER_SIZE, "HTTP/1.1 404 Not Found\r\n\r\n");
-            send(client_socket, response, strlen(response), 0);
-        } else {
-            snprintf(response, BUFFER_SIZE, "HTTP/1.1 200 OK\r\n\r\n");
-            send(client_socket, response, strlen(response), 0);
-            while ((bytes_read = read(file_fd, response, BUFFER_SIZE - 1)) > 0) {
-                send(client_socket, response, bytes_read, 0);
-            }
-            close(file_fd);
-        }
-    } else {
-        snprintf(response, BUFFER_SIZE, "HTTP/1.1 400 Bad Request\r\n\r\n");
-        send(client_socket, response, strlen(response), 0);
-    }
-    closesocket(client_socket);
+void sig_handler(int signo) {
+    if (signo == SIGINT) stop = true;
 }
 
-int main(void) {
-    int server_socket, client_socket;
-    struct sockaddr_in server_address, client_address;
-    socklen_t client_address_len = sizeof(client_address);
-
-    // Инициализация Winsock
+int build_server_socket() {
     WSADATA wsaData;
-    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (iResult != 0) {
-        printf("WSAStartup failed: %d\n", iResult);
-        return 1;
-    }
-
-    // Создаем сокет
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0) {
-        int error = WSAGetLastError();  // Получаем код ошибки
-        printf("Cannot create socket...: %d\n", error);
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        perror("WSAStartup failed");
+        WSACleanup();
         exit(EXIT_FAILURE);
     }
 
-    // Адрес сервера
+    SOCKET server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == INVALID_SOCKET) {
+        perror("Socket opening failed");
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    result = setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    if (result == SOCKET_ERROR) {
+        perror("Socket options setup failed");
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in server_address;
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = INADDR_ANY;
     server_address.sin_port = htons(PORT);
 
-    // Привязываем сокет к адресу
-    if (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
-        int error = WSAGetLastError();
-        printf("Cannot bind socket...: %d\n", error);
-        close(server_socket);
+    result = bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address));
+    if (result == SOCKET_ERROR) {
+        perror("Bind to port failed");
+        WSACleanup();
         exit(EXIT_FAILURE);
     }
 
-    // Слушаем сокет
-    if (listen(server_socket, 5) < 0) {
-        int error = WSAGetLastError();
-        printf("Cannot listen...: %d\n", error);
-        close(server_socket);
+    result = listen(server_socket, 5);
+    if (result == SOCKET_ERROR) {
+        perror("Listen socket failed");
+        WSACleanup();
         exit(EXIT_FAILURE);
     }
 
-    printf("Server listening on port %d\n", PORT);
+    return server_socket;
+}
 
-    // Принимаем входящие соединения
-    while (1) {
-        client_socket = accept(server_socket, (struct sockaddr*)&client_address, &client_address_len);
-        if (client_socket < 0) {
-            int error = WSAGetLastError();
-            printf("Cannot accept connection...: %d\n", error);
-            continue;
+void handle_request(SOCKET client_socket) {
+    char* buffer = calloc(1, MAX_LENGTH);
+    if (buffer == NULL) {
+        perror("Cannot allocate buffer");
+        exit(EXIT_FAILURE);
+    }
+
+    int bytes_read = recv(client_socket, buffer, MAX_LENGTH - 1, 0);
+    if (bytes_read < 0) {
+        perror("Read from buffer failed");
+        exit(EXIT_FAILURE);
+    }
+
+    buffer[bytes_read] = 0;
+
+    request* req = new_request();
+    parse_request(buffer, req);
+    printf("[REQUEST] %s %s\n", req->method, req->target);
+    free(buffer);
+
+    response* res = new_response();
+    build_response(req, res);
+    send_response(client_socket, res);
+
+    closesocket(client_socket);
+    destroy_request(req);
+    destroy_response(res);
+}
+
+void run_server(SOCKET server_socket) {
+    struct sockaddr_in client_address;
+    int client_address_len = sizeof(client_address);
+
+    while (!stop) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(server_socket, &fds);
+
+        int result = select((int)server_socket + 1, &fds, NULL, NULL, NULL);
+        if (result == SOCKET_ERROR) {
+            perror("Select failed");
+            exit(EXIT_FAILURE);
         }
+
+        if (stop) break;
+        if (!result) continue;
+
+        SOCKET client_socket = accept(server_socket, (struct sockaddr*)&client_address, &client_address_len);
 
         handle_request(client_socket);
     }
+}
 
-    close(server_socket);
+int main(void) {
+    SOCKET server_socket;
+    signal(SIGINT, sig_handler);
+    server_socket = build_server_socket();
+    run_server(server_socket);
+    closesocket(server_socket);
     WSACleanup();
-    return 0;
+
+    return EXIT_SUCCESS;
 }
